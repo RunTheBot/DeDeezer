@@ -1,0 +1,1 @@
+pnpm dlx @electron/asar pack .\decomp\ app.new.asar; cp .\app.new.asar C:\Users\aaron\AppData\Local\Programs\deezer-desktop\resources\app.asar

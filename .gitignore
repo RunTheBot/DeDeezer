@@ -1,0 +1,6 @@
+node_modules/
+locales/
+assets/
+ublock/
+decomp/
+*.asar
