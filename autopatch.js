@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync, spawn } = require('child_process');
 const os = require('os');
+const readline = require('readline');
 
 class DeezerPatcher {
   constructor() {
@@ -83,12 +84,14 @@ class DeezerPatcher {
 
       console.log(`\n🚀 Starting DeDeezer patching process...`);
       
+      await this.step0_KillDeezer();
+      await this.step0_CheckIfPatched();
       await this.step1_CreateBackup();
       await this.step2_CreateTempFolder();
       await this.step3_ExtractAsar();
       await this.step4_RenameMainJs();
       await this.step5_CopyNewMainJs();
-      await this.step6_CleanAndReinstallDeps();
+      await this.step6_AddGhosteryDependencies();
       await this.step7_RepackAsar();
       await this.step8_CopyBack();
       
@@ -103,23 +106,141 @@ class DeezerPatcher {
     }
   }
 
-  async step1_CreateBackup() {
-    console.log(`\n📋 Step 1: Creating backup of original asar file...`);
+  async step0_KillDeezer() {
+    console.log(`\n📋 Step 0a: Checking for running Deezer processes...`);
+    
+    try {
+      if (this.platform === 'win32') {
+        // Check if Deezer is running
+        try {
+          execSync('tasklist /FI "IMAGENAME eq Deezer.exe" 2>NUL | find /I /N "Deezer.exe"', { stdio: 'pipe' });
+          console.log(`🔄 Deezer is running, attempting to close it...`);
+          
+          // Try to kill Deezer gracefully first, then forcefully
+          try {
+            execSync('taskkill /IM "Deezer.exe" /T', { stdio: 'pipe' });
+            console.log(`✅ Deezer closed gracefully`);
+          } catch {
+            execSync('taskkill /IM "Deezer.exe" /T /F', { stdio: 'pipe' });
+            console.log(`✅ Deezer force closed`);
+          }
+          
+          // Wait a moment for process to fully terminate
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch {
+          console.log(`✅ Deezer is not running`);
+        }
+      } else {
+        // For macOS/Linux - implement later
+        console.log(`⚠️  Process killing not implemented for ${this.platform} yet`);
+      }
+    } catch (error) {
+      console.log(`⚠️  Could not check/kill Deezer process: ${error.message}`);
+    }
+  }
+
+  async step0_CheckIfPatched() {
+    console.log(`\n📋 Step 0b: Checking if Deezer is already patched...`);
     
     const originalAsar = path.join(this.paths.deezerPath, 'resources', this.paths.asarFile);
+    const backupFile = path.join(this.paths.deezerPath, 'resources', 'app.bak.asar');
     
     if (!fs.existsSync(originalAsar)) {
       throw new Error(`Deezer asar file not found at: ${originalAsar}`);
     }
     
-    // Create backup directory
-    if (!fs.existsSync(this.backupDir)) {
-      fs.mkdirSync(this.backupDir, { recursive: true });
+    // Check for patch signature in the current asar
+    const isPatched = await this.checkPatchSignature(originalAsar);
+    
+    if (isPatched) {
+      console.log(`🔍 Deezer appears to already be patched!`);
+      
+      if (fs.existsSync(backupFile)) {
+        console.log(`📦 Found existing backup file: ${backupFile}`);
+        const shouldRepatch = await this.askUserConfirmation(
+          'Deezer is already patched. Do you want to repatch using the backup file? (y/n): '
+        );
+        
+        if (shouldRepatch) {
+          console.log(`🔄 Using existing backup for repatching...`);
+          this.useExistingBackup = true;
+        } else {
+          console.log(`❌ Patching cancelled by user.`);
+          process.exit(0);
+        }
+      } else {
+        console.log(`⚠️  No backup file found. Cannot safely repatch.`);
+        console.log(`❌ Please restore original Deezer installation first.`);
+        process.exit(1);
+      }
+    }
+  }
+
+  async checkPatchSignature(asarPath) {
+    try {
+      // Extract a small portion to check for our signature
+      const tempCheck = path.join(os.tmpdir(), 'deezer-check-' + Date.now());
+      fs.mkdirSync(tempCheck, { recursive: true });
+      
+      const extractCmd = `npm dlx @electron/asar extract "${asarPath}" "${tempCheck}"`;
+      execSync(extractCmd, { stdio: 'pipe' });
+      
+      const mainJsPath = path.join(tempCheck, 'build', 'main.js');
+      if (fs.existsSync(mainJsPath)) {
+        const content = fs.readFileSync(mainJsPath, 'utf8');
+        const isPatched = content.includes('DZ_DEVTOOLS') || content.includes('[inject]');
+        
+        // Cleanup
+        fs.rmSync(tempCheck, { recursive: true, force: true });
+        return isPatched;
+      }
+      
+      // Cleanup
+      fs.rmSync(tempCheck, { recursive: true, force: true });
+      return false;
+    } catch (error) {
+      console.log(`⚠️  Could not check patch signature: ${error.message}`);
+      return false;
+    }
+  }
+
+  async askUserConfirmation(question) {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    
+    return new Promise((resolve) => {
+      rl.question(question, (answer) => {
+        rl.close();
+        resolve(answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes');
+      });
+    });
+  }
+
+  async step1_CreateBackup() {
+    console.log(`\n📋 Step 1: Creating backup of original asar file...`);
+    
+    const originalAsar = path.join(this.paths.deezerPath, 'resources', this.paths.asarFile);
+    const backupFile = path.join(this.paths.deezerPath, 'resources', 'app.bak.asar');
+    
+    if (!fs.existsSync(originalAsar)) {
+      throw new Error(`Deezer asar file not found at: ${originalAsar}`);
     }
     
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupFile = path.join(this.backupDir, `app.asar.backup.${timestamp}`);
+    // Check if backup already exists and we're not repatching
+    if (fs.existsSync(backupFile) && !this.useExistingBackup) {
+      console.log(`📦 Backup file already exists: ${backupFile}`);
+      console.log(`✅ Skipping backup creation to preserve original`);
+      return;
+    }
     
+    if (this.useExistingBackup) {
+      console.log(`✅ Using existing backup file for repatching`);
+      return;
+    }
+    
+    // Create backup in the same directory as the original
     fs.copyFileSync(originalAsar, backupFile);
     console.log(`✅ Backup created: ${backupFile}`);
   }
@@ -138,10 +259,19 @@ class DeezerPatcher {
   async step3_ExtractAsar() {
     console.log(`\n📋 Step 3: Extracting asar file...`);
     
-    const originalAsar = path.join(this.paths.deezerPath, 'resources', this.paths.asarFile);
+    // Use backup file if repatching, otherwise use current asar
+    let sourceAsar;
+    if (this.useExistingBackup) {
+      sourceAsar = path.join(this.paths.deezerPath, 'resources', 'app.bak.asar');
+      console.log(`🔄 Extracting from backup file for repatching...`);
+    } else {
+      sourceAsar = path.join(this.paths.deezerPath, 'resources', this.paths.asarFile);
+      console.log(`📦 Extracting from current asar file...`);
+    }
+    
     const extractPath = path.join(this.tempDir, 'extracted');
     
-    const extractCmd = `${this.packageManager} dlx @electron/asar extract "${originalAsar}" "${extractPath}"`;
+    const extractCmd = `${this.packageManager} dlx @electron/asar extract "${sourceAsar}" "${extractPath}"`;
     console.log(`🔧 Running: ${extractCmd}`);
     
     execSync(extractCmd, { stdio: 'inherit' });
@@ -178,8 +308,8 @@ class DeezerPatcher {
     console.log(`✅ Copied patched main.js`);
   }
 
-  async step6_CleanAndReinstallDeps() {
-    console.log(`\n📋 Step 6: Cleaning and reinstalling dependencies...`);
+  async step6_AddGhosteryDependencies() {
+    console.log(`\n📋 Step 6: Adding Ghostery dependencies and cleaning...`);
     
     const extractPath = path.join(this.tempDir, 'extracted');
     const nodeModulesPath = path.join(extractPath, 'node_modules');
@@ -197,10 +327,23 @@ class DeezerPatcher {
       return;
     }
     
-    // Install dependencies
-    console.log(`📦 Installing dependencies with ${this.packageManager}...`);
+    // Install Ghostery adblocker dependency (always use npm for asar compatibility)
+    console.log(`👻 Installing Ghostery adblocker dependency with npm...`);
+    const ghosteryCmd = 'npm install --save @ghostery/adblocker-electron';
+    console.log(`🔧 Running: ${ghosteryCmd}`);
     
-    const installCmd = this.getInstallCommand();
+    execSync(ghosteryCmd, { 
+      cwd: extractPath, 
+      stdio: 'inherit',
+      env: { ...process.env, NODE_ENV: 'production' }
+    });
+    
+    console.log(`✅ Ghostery dependency installed`);
+    
+    // Install remaining dependencies (always use npm for asar compatibility)
+    console.log(`📦 Installing remaining dependencies with npm...`);
+    
+    const installCmd = 'npm install --production';
     console.log(`🔧 Running: ${installCmd}`);
     
     execSync(installCmd, { 
@@ -209,19 +352,17 @@ class DeezerPatcher {
       env: { ...process.env, NODE_ENV: 'production' }
     });
     
-    console.log(`✅ Dependencies installed`);
+    console.log(`✅ All dependencies installed`);
   }
 
   getInstallCommand() {
-    switch (this.packageManager) {
-      case 'pnpm':
-        return 'pnpm install --prod';
-      case 'yarn':
-        return 'yarn install --production';
-      case 'npm':
-      default:
-        return 'npm install --production';
-    }
+    // Always use npm for asar compatibility (pnpm/yarn create symlink issues)
+    return 'npm install --production';
+  }
+
+  getGhosteryInstallCommand() {
+    // Always use npm for asar compatibility (pnpm/yarn create symlink issues)
+    return 'npm install --save @ghostery/adblocker-electron';
   }
 
   async step7_RepackAsar() {
